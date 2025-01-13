@@ -1,7 +1,11 @@
 import 'dart:io';
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:http/http.dart' as http;
+// import 'package:flutter_webrtc/flutter_webrtc.dart';
+// import 'package:web_socket_channel/web_socket_channel.dart';
+
 
 class NetworkInfo {
   Future<void> checkNAT() async {
@@ -15,26 +19,32 @@ class NetworkInfo {
     }
   }
 
- Future<void> printIps() async {
+ Future<List<String>> printIps() async {
   List<NetworkInterface> interfaces = await NetworkInterface.list(
-    includeLoopback: false, 
-    includeLinkLocal: false, 
+    includeLoopback: false,
+    includeLinkLocal: false,
   );
 
+  List<String> activeIPs = [];
   print('Active Local IPs:');
   for (var interface in interfaces) {
-   
     if (interface.addresses.isNotEmpty) {
       print('== Interface: ${interface.name} ==');
       for (var address in interface.addresses) {
         String ip = address.address;
         String ipType = address.type == InternetAddressType.IPv6 ? "IPv6" : "IPv4";
         bool isPrivate = isPrivateIP(ip);
-        print('$ipType Address: $ip (${isPrivate ? "Private" : "Public"})');
+
+        if (isPrivate) {
+          activeIPs.add(ip);
+          print('$ipType Address: $ip (Private)');
+        }
       }
     }
   }
+  return activeIPs;
 }
+
 
   Future<bool> checkIfBehindNAT(String publicIP) async {
     List<NetworkInterface> interfaces = await NetworkInterface.list();
@@ -257,25 +267,37 @@ bool _isValidIp(String ip) {
     socket.close();
     return publicIP != null && publicPort != null ? '$publicIP:$publicPort' : '';
   }
-Future<void> startListening({int port = 8180}) async {
+Future<void> startListening({int port = 8888}) async {
+  try {
     final server = await ServerSocket.bind(InternetAddress.anyIPv4, port);
-    print('Listening on ${server.address.address}:$port');
+    print('Server is listening on all interfaces (0.0.0.0):$port');
 
     await for (var socket in server) {
       print('New connection from ${socket.remoteAddress.address}:${socket.remotePort}');
-      socket.write('Welcome to the listening node!\n');
-      socket.listen((data) {
-        print('Received: ${utf8.decode(data)}');
-        socket.write('Echo: ${utf8.decode(data)}');
-      });
+      
+      socket.listen(
+        (data) {
+          print('Received: ${utf8.decode(data)}');
+          socket.write('HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nWelcome to the server!');
+        },
+        onDone: () {
+          print('Client closed the connection');
+          socket.close();  
+        },
+        onError: (error) {
+          print('Error: $error');
+          socket.close();
+        }
+      );
     }
+  } catch (e) {
+    print('Error starting the server: $e');
   }
-  
 }
 
 void main() async {
   final networkInfo = NetworkInfo();
   await networkInfo.checkNAT();
   await networkInfo.determineNATType();
-  networkInfo.startListening(port: 8180);
+  networkInfo.startListening(port: 8888);
 }
