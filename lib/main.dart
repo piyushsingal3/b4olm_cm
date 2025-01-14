@@ -2,49 +2,77 @@ import 'dart:io';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
-import 'package:http/http.dart' as http;
-// import 'package:flutter_webrtc/flutter_webrtc.dart';
-// import 'package:web_socket_channel/web_socket_channel.dart';
-
 
 class NetworkInfo {
   Future<void> checkNAT() async {
     try {
       await printIps();
-      String publicIP = await getPublicIP('stun.l.google.com', 19302);
-      bool isBehindNAT = await checkIfBehindNAT(publicIP);
-      print(isBehindNAT ? "The device is behind a   NAT." : "The device is not behind a NAT.");
+      
+      Map< String , dynamic> public=await getPublicIP('stun.l.google.com', 19302);
+      String publicIp=public['publicIP'];
+      bool isBehindNAT = await checkIfBehindNAT(publicIp);
     } catch (e) {
       print("Error: $e");
     }
   }
 
- Future<List<String>> printIps() async {
-  List<NetworkInterface> interfaces = await NetworkInterface.list(
-    includeLoopback: false,
-    includeLinkLocal: false,
-  );
+  Future<List<List<dynamic>>> printIps() async {
+    List<List<dynamic>> activeIPs = [];
+    try {
+      ProcessResult result = await Process.run(
+        'powershell',
+        [
+          '-Command',
+          r'(Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null }).InterfaceAlias'
+        ],
+      );
 
-  List<String> activeIPs = [];
-  print('Active Local IPs:');
-  for (var interface in interfaces) {
-    if (interface.addresses.isNotEmpty) {
-      print('== Interface: ${interface.name} ==');
-      for (var address in interface.addresses) {
-        String ip = address.address;
-        String ipType = address.type == InternetAddressType.IPv6 ? "IPv6" : "IPv4";
-        bool isPrivate = isPrivateIP(ip);
+      if (result.exitCode == 0) {
+  
+        String output = result.stdout.trim();
+        if (output.isNotEmpty) {
+          String activeInterfaceName = output;
 
-        if (isPrivate) {
-          activeIPs.add(ip);
-          print('$ipType Address: $ip (Private)');
+
+
+          for (var interface in await NetworkInterface.list()) {
+            if (interface.name == activeInterfaceName) {
+              for (var address in interface.addresses) {
+                String ip = address.address;
+                String ipType =
+                    address.type == InternetAddressType.IPv6 ? "IPv6" : "IPv4";
+                String isPrivate = isPrivateIP(ip) ? "Yes" : "No";
+                Map< String , dynamic> public=await getPublicIP('stun.l.google.com', 19302);
+                String? publicIP=public['publicIP'];
+                int? publicPort=public['publicPort'];
+                bool? behindNAT = publicIP != null ? await checkIfBehindNAT(publicIP) : null;
+                String? natType = publicIP != null && behindNAT != null
+                    ? await determineNATType()
+                    : null;
+                int? isBehindNAT=0;
+                if(behindNAT==true){
+                    isBehindNAT=1;
+                }
+
+                // [type, address, private, publicIP,publicPort isBehindNAT, natType]
+                activeIPs.add([ipType, ip, isPrivate, publicIP,publicPort, isBehindNAT, natType]);
+
+
+              }
+              break;
+            }
+          }
+        } else {
+          print('No active interface found.');
         }
+      } else {
+        print('Failed to determine the active interface.');
       }
+    } catch (e) {
+      print('Error: $e');
     }
+    return activeIPs;
   }
-  return activeIPs;
-}
-
 
   Future<bool> checkIfBehindNAT(String publicIP) async {
     List<NetworkInterface> interfaces = await NetworkInterface.list();
@@ -75,9 +103,8 @@ class NetworkInfo {
     return false; 
   }
 
-  Future<String> getPublicIP(String stunServer, int stunPort) async {
+Future<Map<String, dynamic>> getPublicIP(String stunServer, int stunPort) async {
   final socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
-  print('Using local port: ${socket.port} to communicate with $stunServer:$stunPort');
 
   final transactionId = List<int>.generate(12, (i) => i);
   final stunMessage = Uint8List.fromList([
@@ -93,13 +120,12 @@ class NetworkInfo {
 
   if (stunServerAddress.isEmpty) {
     print('Failed to resolve STUN server address.');
-    return '';
+    return {'publicIP': null, 'publicPort': null};
   }
 
   final stunServerIP = stunServerAddress.first;
 
   socket.send(stunMessage, stunServerIP, stunPort);
-  print('STUN request sent to $stunServerIP:$stunPort');
 
   String? publicIP;
   int? publicPort;
@@ -113,7 +139,8 @@ class NetworkInfo {
           final addressFamily = response[25];
           if (addressFamily == 0x01) { // IPv4
             final magicCookie = [0x21, 0x12, 0xA4, 0x42];
-            publicPort = (response[26] << 8 | response[27]) ^ (magicCookie[0] << 8 | magicCookie[1]);
+            publicPort = (response[26] << 8 | response[27]) ^
+                (magicCookie[0] << 8 | magicCookie[1]);
             final ip = [
               response[28] ^ magicCookie[0],
               response[29] ^ magicCookie[1],
@@ -121,37 +148,32 @@ class NetworkInfo {
               response[31] ^ magicCookie[3],
             ].join('.');
             publicIP = ip;
-            print('Public IP: $ip, Port: $publicPort');
+
           } else {
             print('Received a non-IPv4 response.');
           }
         } else {
           print('Invalid STUN response.');
         }
-        break;
       }
+      break;
     }
   }
 
   socket.close();
-  return publicIP != null && publicPort != null ? '$publicIP:$publicPort' : '';
+  return {
+    'publicIP': publicIP,
+    'publicPort': publicPort,
+  };
 }
-
-bool _isValidIp(String ip) {
-  final ipRegex = RegExp(
-    r'^(\d{1,3}\.){3}\d{1,3}(:\d+)?$', 
-  );
-  return ipRegex.hasMatch(ip);
-}
- final _magicCookie = [0x21, 0x12, 0xA4, 0x42];
-
-  Future<void> determineNATType() async {
+ Future<String> determineNATType() async {
     try {
       String natType = await _performNATTests();
-      print("Determined NAT Type: $natType");
+      return natType;
     } catch (e) {
       print("Error determining NAT Type: $e");
     }
+    return "Null";
   }
 
   Future<String> _performNATTests() async {
@@ -170,7 +192,7 @@ bool _isValidIp(String ip) {
     String publicIP1 = parts[0];
     int publicPort1 = int.parse(parts[1]);
 
-    // Check if the local address matches the public address (no NAT)
+  
     List<NetworkInterface> interfaces = await NetworkInterface.list();
     bool isNatted = true;
 
@@ -207,6 +229,7 @@ bool _isValidIp(String ip) {
 
     return "Port Restricted Cone NAT";
   }
+   final _magicCookie = [0x21, 0x12, 0xA4, 0x42];
 
   Future<String> _stunTest(String stunServer, int stunPort, {bool changeIP = false, bool changePort = false}) async {
     final socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
@@ -233,7 +256,7 @@ bool _isValidIp(String ip) {
 
     final stunServerIP = stunServerAddress.first;
     socket.send(stunMessage, stunServerIP, stunPort);
-    print('STUN request sent to $stunServerIP:$stunPort');
+
 
     String? publicIP;
     int? publicPort;
@@ -254,7 +277,7 @@ bool _isValidIp(String ip) {
                 response[31] ^ _magicCookie[3],
               ].join('.');
               publicIP = ip;
-              print('Mapped Address: $ip:$publicPort');
+
             } else {
               print('Received a non-IPv4 response.');
             }
@@ -267,31 +290,33 @@ bool _isValidIp(String ip) {
     socket.close();
     return publicIP != null && publicPort != null ? '$publicIP:$publicPort' : '';
   }
-Future<void> startListening({int port = 8888}) async {
-  try {
-    final server = await ServerSocket.bind(InternetAddress.anyIPv4, port);
-    print('Server is listening on all interfaces (0.0.0.0):$port');
 
-    await for (var socket in server) {
-      print('New connection from ${socket.remoteAddress.address}:${socket.remotePort}');
-      
-      socket.listen(
-        (data) {
-          print('Received: ${utf8.decode(data)}');
-          socket.write('HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nWelcome to the server!');
-        },
-        onDone: () {
-          print('Client closed the connection');
-          socket.close();  
-        },
-        onError: (error) {
-          print('Error: $error');
-          socket.close();
-        }
-      );
+  Future<void> startListening({int port = 8888}) async {
+    try {
+      final server = await ServerSocket.bind(InternetAddress.anyIPv4, port);
+      print('Server is listening on all interfaces (0.0.0.0):$port');
+
+      await for (var socket in server) {
+        print('New connection from ${socket.remoteAddress.address}:${socket.remotePort}');
+        
+        socket.listen(
+          (data) {
+            print('Received: ${utf8.decode(data)}');
+            socket.write('HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nWelcome to the server!');
+          },
+          onDone: () {
+            print('Client closed the connection');
+            socket.close();  
+          },
+          onError: (error) {
+            print('Error: $error');
+            socket.close();
+          }
+        );
+      }
+    } catch (e) {
+      print('Error starting the server: $e');
     }
-  } catch (e) {
-    print('Error starting the server: $e');
   }
 }
 
@@ -299,5 +324,18 @@ void main() async {
   final networkInfo = NetworkInfo();
   await networkInfo.checkNAT();
   await networkInfo.determineNATType();
-  networkInfo.startListening(port: 8888);
+  
+  List<List<dynamic>> activeIPs = await networkInfo.printIps();
+
+  if (activeIPs.isEmpty) {
+    print('No active IPs found.');
+  } else {
+    print('All IPs of active interface:');
+    for (var ipInfo in activeIPs) {
+      print('Type: ${ipInfo[0]}, Address: ${ipInfo[1]}, Private: ${ipInfo[2]}');
+      print('Public IP: ${ipInfo[3]},Public Port: ${ipInfo[4]} NATed: ${ipInfo[5]}, NAT Type: ${ipInfo[6]}');
+    }
+  }
+  await networkInfo.startListening(port: 8888);
+
 }
