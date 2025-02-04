@@ -1,0 +1,36 @@
+{
+    "servers": [
+      {
+        "hashID": "",
+        "publicKey": "",
+        "sign": "",
+        "publicKeyPem": "",
+        "localIpv4": "",
+        "publicIpv4": "35.247.176.120",
+        "publicIpv6": "",
+        "natStatus": "",
+        "localIpv4Port": "",
+        "publicIpv4Port": "",
+        "publicIpv6Port": "",
+        "communicatorIP": "",
+        "communicatorPort": "",
+        "listeningPort": 43754
+      },
+      {
+        "hashID": "",
+        "publicKey": "",
+        "sign": "",
+        "publicKeyPem": "",
+        "localIpv4": "",
+        "publicIpv4": " 34.131.221.94",
+        "publicIpv6": "",
+        "natStatus": "",
+        "localIpv4Port": "",
+        "publicIpv4Port": "",
+        "publicIpv6Port": "",
+        "communicatorIP": "",
+        "communicatorPort": "",
+        "listeningPort": 8180
+      }
+    ]
+  }
