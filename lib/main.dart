@@ -1,75 +1,288 @@
+import 'dart:collection';
 import 'dart:io';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
-
+import 'udpPkg.dart';
+import 'networkInformation.dart';
 
 class NetworkInfo {
-static Future<Map<String, int>> loadServersFromJson(String filePath) async {
-  try {
-    print('Looking for JSON file at: ${Directory.current.path}/${filePath}');
 
-    final file = File(filePath);
-    if (!await file.exists()) {
-      print('Error: JSON file not found.');
-      return {};
+
+
+Map<String, Socket> connectedClients = {};
+Queue<String> messageQueue = Queue<String>();
+Map<String, Queue<String>> cmOutBuffer = {};
+Map<String, Queue<String>> rootNodeBuffer = {};
+Socket? relaySocket;
+
+
+
+
+
+void _removeClient(Socket socket) {
+  String? keyToRemove;
+
+  connectedClients.forEach((key, value) {
+    if (value == socket) {
+      keyToRemove = key;
+    }
+  });
+
+  if (keyToRemove != null) {
+    connectedClients.remove(keyToRemove);
+    print("Client $keyToRemove disconnected.");
+  }
+}
+
+
+Future<void> startRelayServer({int port = 8888}) async {
+  try {
+    final server = await ServerSocket.bind(InternetAddress.anyIPv4, port);
+    print('Relay Server is listening on port $port');
+
+    await for (var socket in server) {
+      socket.listen(
+        (data) {
+          String message = utf8.decode(data);
+          print('Received: $message');
+
+          try {
+            Map<String, dynamic> receivedData = jsonDecode(message);
+
+            if (receivedData.containsKey("command") && receivedData["command"] == "REGISTER") {
+              // Handles relay registration
+              String nodeId = receivedData["node"]["hashID"];
+              connectedClients[nodeId] = socket;
+              print(socket);
+              print('Remote Address: ${socket.remoteAddress.address}');
+              print('Remote Port: ${socket.remotePort}');
+              print('Local Address: ${socket.address.address}');
+              print('Local Port: ${socket.port}');
+              print("Node registered: $nodeId  socket:  " );
+
+              _sendBufferedMessages(nodeId);
+            } 
+            else if (receivedData.containsKey("destinationNode")) {
+              // Handle relaying messages
+              String targetId = receivedData["destinationNodeHash"];
+              String relayMessage = receivedData["query"];
+              String response = receivedData["response"];
+              Map<String, dynamic> sourceNode=receivedData["sourceNode"];
+              Map<String, dynamic> destinationNode=receivedData["destinationNode"];
+
+              _relayMessage(sourceNode,destinationNode,targetId, relayMessage,response);
+            }
+          } catch (e) {
+            print("Error decoding message: $e");
+          }
+        },
+        onDone: () {
+          _removeClient(socket);
+        },
+        onError: (error) {
+          print('Error: $error');
+          _removeClient(socket);
+        },
+      );
+    }
+  } catch (e) {
+    print('Error starting relay server: $e');
+  }
+}
+
+// Function to relay messages
+Future<void> _relayMessage(Map<String, dynamic> sourceNode, Map<String, dynamic> destinationNode, String targetId, String query,String response) async {
+  try {
+    Map<String, dynamic> CreateMessage = {
+      "destinationNodeHash": targetId,
+      "sourceNode": sourceNode,
+      "destinationNode": destinationNode,
+      "sourceModule": "CM",
+      "destinationModule": "CM",
+      "query": query,
+      "layerID": 0,
+      "response": response
+    };
+
+    String filePath = 'rttable0.json';
+    List<Map<String, dynamic>> nodes = await NetworkInfo.readJsonFile(filePath);
+
+    for (var node in nodes) {
+      printNode(node);
+      print(calculateDistance(node['hashID'], targetId));
     }
 
-    String content = await file.readAsString();
-    Map<String, dynamic> jsonData = jsonDecode(content);
+    if (targetId == nodes[0]['hashID']) {
+      print("Message received by the target node: $targetId");
+  
+    } else if (connectedClients.containsKey(targetId)) {
+      try {
+        connectedClients[targetId]!.write(jsonEncode(CreateMessage));
+        print("Relayed message to Node $targetId - $query");
+     
+      } catch (e) {
+        cmOutBuffer.putIfAbsent(targetId, () => Queue<String>()).add(jsonEncode(CreateMessage));
+        print("Failed to send message to $targetId directly, keeping in buffer.");
+      }
+    } else {
+      print("Target Node $targetId is not connected. Trying to send via closest node.");
 
-    Map<String, int> servers = {};
-    if (jsonData['servers'] != null && jsonData['servers'] is List) {
-      for (var server in jsonData['servers']) {
-        if (server is Map<String, dynamic> && 
-            server['publicIpv4'] is String && 
-            server['listeningPort'] is int) {
-          
-          String ip = server['publicIpv4'].trim();
-          int port = server['listeningPort'];
-          servers[ip] = port;
+      Map<String, dynamic>? minDistNode;
+      BigInt minDist = BigInt.parse('1' + '0' * 1000);
+
+      for (var node in nodes) {
+        BigInt currentDist = calculateDistance(node['hashID'], targetId);
+        if (currentDist < minDist) {
+          minDist = currentDist;
+          minDistNode = node;
         }
       }
-    }
-    return servers;
-  } catch (e) {
-    print('Error reading JSON file: \$e');
-    return {};
-  }
-}
 
-static Future<String> findClosestServer(Map<String, int> servers) async {
-  String closestServer = '';
-  int minTime = 99999999;
-
-  for (var entry in servers.entries) {
-    String server = entry.key;
-    int port = entry.value;
-
-    try {
-      Stopwatch stopwatch = Stopwatch()..start();
-      Socket socket = await Socket.connect(server, port, timeout: Duration(seconds: 3));
-      stopwatch.stop();
-      socket.destroy();  // Close connection
-
-      int elapsedTime = stopwatch.elapsedMilliseconds;
-      print('Server ${server} on port ${port} responded in ${elapsedTime} ms');
-
-      if (elapsedTime < minTime) {
-        minTime = elapsedTime;
-        closestServer = '${server}:${port}';
+      if (minDistNode != null) {
+        await _sendViaProxy(minDistNode, CreateMessage, targetId);
       }
-    } catch (e) {
-      print('Failed to connect to ${server} on port ${port}: ${e}');
     }
+  } catch (e) {
+    print('Relay server failed to send message to Node $targetId - $e');
   }
-
-  return closestServer;
 }
+
+Future<void> _sendViaProxy(Map<String, dynamic> proxyNode, Map<String, dynamic> message, String targetId) async {
+  try {
+    Socket proxySocket = await Socket.connect(proxyNode['publicIpv4'], proxyNode['listeningPort']);
+    proxySocket.write(jsonEncode(message));
+    print('Relayed message to next proxy: ${proxyNode['hashID']}');
+  } catch (e) {
+    rootNodeBuffer.putIfAbsent(targetId, () => Queue<String>()).add(jsonEncode(message));
+    print("Couldn't send message to closest proxy: ${proxyNode['hashID']}. Keeping in buffer.");
+  }
+}
+
+
+void _sendBufferedMessages(String nodeId) {
+  if (cmOutBuffer.containsKey(nodeId)) {
+    while (cmOutBuffer[nodeId]!.isNotEmpty) {
+      String message = cmOutBuffer[nodeId]!.removeFirst();
+      connectedClients[nodeId]!.write(message);
+      print("Sent buffered message to Node $nodeId - $message");
+    }
+    cmOutBuffer.remove(nodeId); // Remove entry if queue is empty
+  }
+}
+
+
+// Function to register and maintain a connection
+
+
+Future<void> registerWithRelay(String relayIp, int relayPort, Map<String, dynamic> myNode) async {
+  try {
+    relaySocket = await Socket.connect(relayIp, relayPort);
+    print('Registered with relay: $relayIp:$relayPort');
+
+    // Send registration message
+    Map<String, dynamic> registrationMessage = {"command": "REGISTER", "node": myNode};
+    relaySocket!.write(jsonEncode(registrationMessage));
+
+    relaySocket!.listen(
+      (data) {
+        String received = utf8.decode(data);
+        print('Received from relay: $received');
+
+        try {
+          Map<String, dynamic> receivedMessage = jsonDecode(received);
+
+          if (receivedMessage.containsKey("destinationNodeHash") &&
+              receivedMessage.containsKey("sourceNode") &&
+              receivedMessage.containsKey("destinationNode")) {
+           
+            // Check if "response" field is absent or empty
+             print(receivedMessage["response"].toString().isEmpty);
+            if (!receivedMessage.containsKey("response") || receivedMessage["response"].toString().isEmpty) {
+              Map<String, dynamic> responseMessage = {
+                "destinationNodeHash": receivedMessage["sourceNode"]["hashID"],
+                "sourceNode": receivedMessage["destinationNode"],
+                "destinationNode": receivedMessage["sourceNode"],
+                "sourceModule": receivedMessage["destinationModule"],
+                "destinationModule": receivedMessage["sourceModule"],
+                "query": receivedMessage["query"],
+                "layerID": receivedMessage["layerID"],
+                "response": "Received by Node ${myNode['hashID']}"
+              };
+
+              relaySocket!.write(jsonEncode(responseMessage));
+              print("Replied to relay: ${jsonEncode(responseMessage)}");
+            }
+          }
+
+        } catch (e) {
+          print("Error decoding received message: $e");
+        }
+      },
+      onDone: () {
+        print('Disconnected from relay.');
+        relaySocket = null;
+      },
+      onError: (error) {
+        print('Relay socket error: $error');
+        relaySocket = null;
+      },
+    );
+
+    // Check and send any buffered messages for this node
+    String nodeId = myNode["hashID"];
+    if (cmOutBuffer.containsKey(nodeId)) {
+      while (cmOutBuffer[nodeId]!.isNotEmpty) {
+        String queuedMessage = cmOutBuffer[nodeId]!.removeFirst();
+        relaySocket!.write(queuedMessage);
+        print("Sent queued message to relay: $queuedMessage");
+      }
+      cmOutBuffer.remove(nodeId); // Clear buffer after sending
+    }
+
+  } catch (e) {
+    print('Failed to register with relay: $e');
+
+    // Store message in buffer for retry
+    String nodeId = myNode["hashID"];
+    cmOutBuffer.putIfAbsent(nodeId, () => Queue<String>()).add(jsonEncode({"command": "REGISTER", "node": myNode}));
+    print("Stored registration message in buffer for retry.");
+  }
+}
+
+
+// Function to send a message via relay using the same connection
+Future<void> sendMessageViaRelay(Map<String, dynamic> sourceNode, Map<String, dynamic> destinationNode, String message) async {
+  try {
+    Map<String, dynamic> CreateMessage = {
+      "destinationNodeHash": destinationNode["hashID"],
+      "sourceNode": sourceNode,
+      "destinationNode": destinationNode,
+      "sourceModule":"CM",
+      "destinationModule":"CM",
+      "query": message,
+      "layerID":0,
+      "response":""
+    };
+
+    if (relaySocket != null) {
+      relaySocket!.write(jsonEncode(CreateMessage));
+      print('Message sent via relay.');
+    } else {
+      messageQueue.add(jsonEncode(CreateMessage));
+      print('Message queued because relay connection is not established.');
+    }
+  } catch (e) {
+    print('Failed to send message via relay: $e');
+  }
+}
+
+
+
 
   Future<void> checkNAT() async {
     try {
-      await printIps();
+      
       Map< String , dynamic> publicIPv4=await getPublicIPv4('stun.l.google.com', 19302);
       Map< String , dynamic> publicIPv6=await getPublicIPv6('stun.l.google.com', 19302);
       String publicIpv4=publicIPv4['publicIP'];
@@ -81,66 +294,102 @@ static Future<String> findClosestServer(Map<String, int> servers) async {
   }
 
 
-  Future<List<List<dynamic>>> printIps() async {
-    List<List<dynamic>> activeIPs = [];
-    try {
-      ProcessResult result = await Process.run(
-        'powershell',
-        [
-          '-Command',
-          r'(Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null }).InterfaceAlias'
-        ],
-      );
+ Future<List<List<dynamic>>> getNetworkInfo(String stunServer, int stunPort) async {
+      List<List<dynamic>> activeIPs = [];
+      try {
+             
+              var networkInterface=await NetworkInterface.list(includeLinkLocal: false,includeLoopback: false);
+              List<dynamic> actIPList=await getActiveIPList(networkInterface);
+              
+                for(var address in actIPList){
+          
+                  
+                  String ip = address.address;
+                  String ipType = address.type == InternetAddressType.IPv6 ? "IPv6" : "IPv4";
+                  String isPrivate = isPrivateIP(ip) ? "Yes" : "No";
+                  bool? behindNAT;
+                  int? publicPort;
+                  String? natType, publicIP;
 
-      if (result.exitCode == 0) {
-  
-        String output = result.stdout.trim();
-        if (output.isNotEmpty) {
-          String activeInterfaceName = output;
+                  if((isPrivate.startsWith("Y"))){
+                    if(ipType == "IPv4"){
+                      Map< String , dynamic> public=await getPublicIPv4(stunServer, stunPort);
+                      publicIP=public['publicIP'];
+                      publicPort=public['publicPort'];
+                    }
+                    else if(ipType == "IPv6"){
+                      Map< String , dynamic> public=await getPublicIPv6(stunServer, stunPort);
+                      publicIP=public['publicIP'];
+                      publicPort=public['publicPort'];
+                    }
+                    behindNAT = publicIP != null ? await checkIfBehindNAT(publicIP) : null;
+                    natType = publicIP != null && behindNAT != null
+                        ? await determineNATType()
+                        : null;
 
+                  }
 
+                  if((isPrivate.startsWith("N"))){
+                    publicIP=ip;
+                    if(ipType == "IPv4") {
+                      publicPort =
+                          (await UDPSocket.bind(InternetAddress.anyIPv4, 0))
+                              .rawSocket.port;
+                    }else if(ipType == "IPv6"){
+                      publicPort =
+                          (await UDPSocket.bind(InternetAddress.anyIPv6, 0))
+                              .rawSocket.port;
+                    }
+                    natType=null;
+                  }
 
-          for (var interface in await NetworkInterface.list()) {
-            if (interface.name == activeInterfaceName) {
-              for (var address in interface.addresses) {
-                String ip = address.address;
-                String ipType =
-                    address.type == InternetAddressType.IPv6 ? "IPv6" : "IPv4";
-                String isPrivate = isPrivateIP(ip) ? "Yes" : "No";
-               
-                Map< String , dynamic> publicIPv4=await getPublicIPv4('stun.l.google.com', 19302);
-                Map< String , dynamic> publicIPv6=await getPublicIPv6('stun.l.google.com', 19302);
-                String? public4=publicIPv4['publicIP'];
-                String? public6=publicIPv6['publicIP'];
-                int? publicPort=publicIPv4['publicPort'];
-                bool? behindNAT = public4 != null ? await checkIfBehindNAT(public4) : null;
-                String? natType = public6 != null && behindNAT != null
-                    ? await determineNATType()
-                    : "";
-                int? isBehindNAT=0;
-                if(behindNAT==true){
+                  int? isBehindNAT=0;
+                  if(behindNAT==true){
                     isBehindNAT=1;
+                  }
+
+                  // [type, address, private, publicIP,publicPort isBehindNAT, natType]
+                  activeIPs.add([ipType, ip, isPrivate, publicIP,publicPort, isBehindNAT, natType]);
+
                 }
-
-                // [type, address, private, publicIP,publicPort ,isBehindNAT, natType]
-                activeIPs.add([ipType, ip, isPrivate, public4,publicPort, isBehindNAT, natType,public6]);
-
-
-              }
-              break;
-            }
-          }
-        } else {
-          print('No active interface found.');
-        }
-      } else {
-        print('Failed to determine the active interface.');
+          
+      } catch (e) {
+        print('Error: $e');
       }
-    } catch (e) {
-      print('Error: $e');
+      return activeIPs;
     }
-    return activeIPs;
+
+  Future<List<InternetAddress>> getActiveIPList(List<NetworkInterface> interfaces) async {
+  List<InternetAddress> internetIPs = [];
+
+  for (var interface in interfaces) {
+    
+    
+    for (var addr in interface.addresses) {
+   
+      
+      try {
+       
+        Socket socket = await Socket.connect(
+          '8.8.8.8',
+          53,
+          sourceAddress: addr.address,
+          timeout: Duration(seconds: 2),
+        );
+        
+        socket.destroy();
+        //print("Connected successfully: ${addr.address}");
+        internetIPs.add(addr);  
+
+      } catch (e) {
+        //print(" Failed to connect: ${addr.address}, Error: $e");
+      }
+    }
+   
   }
+   return internetIPs;
+  
+}
 
   Future<bool> checkIfBehindNAT(String publicIP) async {
     List<NetworkInterface> interfaces = await NetworkInterface.list();
@@ -419,61 +668,141 @@ Future<Map<String, dynamic>> getPublicIPv6(String stunServer, int stunPort) asyn
     return publicIP != null && publicPort != null ? '$publicIP:$publicPort' : '';
   }
 
-  Future<void> startListening({int port = 8888}) async {
-    try {
-      final server = await ServerSocket.bind(InternetAddress.anyIPv4, port);
-      print('Server is listening on all interfaces (0.0.0.0):$port');
+ 
+static Future<List<Map<String, dynamic>>> readJsonFile(String filePath) async {
+  try {
+    final file = File(filePath);
 
-      await for (var socket in server) {
-        print('New connection from ${socket.remoteAddress.address}:${socket.remotePort}');
-        
-        socket.listen(
-          (data) {
-            print('Received: ${utf8.decode(data)}');
-            socket.write('HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nWelcome to the server!');
-          },
-          onDone: () {
-            print('Client closed the connection');
-            socket.close();  
-          },
-          onError: (error) {
-            print('Error: $error');
-            socket.close();
-          }
-        );
-      }
-    } catch (e) {
-      print('Error starting the server: $e');
+    if (!await file.exists()) {
+      print("Error: File does not exist.");
+      return [];
     }
+
+    String jsonString = await file.readAsString();
+
+    if (jsonString.trim().isEmpty) {
+      print("Error: JSON file is empty.");
+      return [];
+    }
+
+    List<dynamic> jsonData = jsonDecode(jsonString);
+
+    if (jsonData is! List) {
+      print("Error: JSON structure is invalid. Expected a list.");
+      return [];
+    }
+
+    return List<Map<String, dynamic>>.from(jsonData);
+  } catch (e) {
+    print("Error reading JSON file: $e");
+    return [];
   }
+}
+BigInt calculateDistance(String nodeId, String proxyNodeId) {
+  // Convert hex node IDs to BigInt for comparison
+  BigInt nodeBigInt = BigInt.parse(nodeId, radix: 16);
+  BigInt proxyBigInt = BigInt.parse(proxyNodeId, radix: 16);
+
+  // Perform XOR operation and return BigInt distance
+  return nodeBigInt ^ proxyBigInt;
+}
+
 }
 
 void main() async {
   final networkInfo = NetworkInfo();
+  final networkDetails=NetworkDetails();
   await networkInfo.checkNAT();
   await networkInfo.determineNATType();
-  
-  List<List<dynamic>> activeIPs = await networkInfo.printIps();
+  String stunServer='stun.l.google.com';
+  int stunPort=19302;
+  List<List<dynamic>> activeIPs = await networkDetails.getNetworkInfo(stunServer,stunPort);
+  String filePath = 'lib/rttable0.json'; 
+
+  List<Map<String, dynamic>> nodes = await NetworkInfo.readJsonFile(filePath);
   
 
-  if (activeIPs.isEmpty) {
-    print('No active IPs found.');
-  } else {
+   if (activeIPs.isEmpty) {
+    print('No active  Network IPs found i.e. no internet.');
+   } else {
     print('All IPs of active interface:');
     for (var ipInfo in activeIPs) {
-      print('Type: ${ipInfo[0]}, Address: ${ipInfo[1]}, Private: ${ipInfo[2]}');
-      print('Public IP: ${ipInfo[3]},Public Port: ${ipInfo[4]} NATed: ${ipInfo[5]}, NAT Type: ${ipInfo[6]}, Public IPv6:${ipInfo[7]}');
+      print('Type: ${ipInfo[0]}, Address: ${ipInfo[1]}, Private: ${ipInfo[2]},Public IP: ${ipInfo[3]},Public Port: ${ipInfo[4]} ');
+      
     }
+   }
+   if (nodes.isEmpty) {
+    print("No nodes found in JSON file.");
+    return;
   }
- 
-    Map<String, int> servers = await NetworkInfo.loadServersFromJson('servers.json');
+  for (var node in nodes) {
+    printNode(node);
+  }
+
+
+  print(NetworkInfo().calculateDistance(nodes[5]['hashID'],nodes[4]['hashID']));
+
+  Map<String, int> servers = {
+    for (var node in nodes)
+      if (node['publicIpv4'] is String && node['listeningPort'] is int)
+        node['publicIpv4'].trim(): node['listeningPort']
+    };
+
   if (servers.isEmpty) {
     print('No servers found in JSON file.');
     return;
   }
 
-  String closestServer = await NetworkInfo.findClosestServer(servers);
-  print('Closest server: $closestServer');
-  await networkInfo.startListening(port: 8888);
+    Map<String, dynamic>? minDistNode;
+    BigInt minDist = BigInt.parse('1' + '0' * 1000);
+    
+    String proxyfilePath = 'lib/proxy.json'; 
+    List<Map<String, dynamic>> proxynodes = await NetworkInfo.readJsonFile(proxyfilePath);
+    for (var node in proxynodes) {
+      printProxy(node);
+    }
+    for (var node in proxynodes) {
+        BigInt currentDist = NetworkInfo().calculateDistance(nodes[0]['hashID'], node['hashID']);
+        if (currentDist < minDist) {
+          minDist = currentDist;
+          minDistNode = node;
+        }
+    }
+    
+    if (minDistNode != null) {
+        print("Connecting with minimum distance proxy : ${minDistNode['publicIpv4']}");
+        try{
+          await networkInfo.registerWithRelay(minDistNode['publicIpv4'],minDistNode['listeningPort'],nodes[0]);
+        }
+        catch(e) {
+            print("Not Registered! Minimum Distance node is not active ${e}");
+        }
+    }
+    else{
+      print("No Proxy node found");
+    }
 
+
+  await networkInfo.sendMessageViaRelay(nodes[0],nodes[0],"Hello remote node" );
+
+
+
+}
+
+void printNode(Map<String, dynamic> node) {
+  print("Node Details:");
+  print("  Hash ID: ${node['hashID']}");
+  print("  Public IPv4: ${node['publicIpv4']}");
+  print("  Listening Port: ${node['listeningPort']}");
+  print("  NAT Status: ${node['natStatus']}");
+  print("  ----------------------");
+}
+
+void printProxy(Map<String, dynamic> node) {
+  print(" Proxy Node Details:");
+  print("  Hash ID: ${node['hashID']}");
+  print("  Public IPv4: ${node['publicIpv4']}");
+  print("  Listening Port: ${node['listeningPort']}");
+  print("  NAT Status: ${node['natStatus']}");
+  print("  ----------------------");
 }
