@@ -1,0 +1,50 @@
+[    {
+    "hashID": "e9a1b7c0c5f2d8e2ff1de6b68c79f1d7093d6b7a",
+    "publicKey": "",
+    "sign": "",
+    "publicKeyPem": "",
+    "localIpv4": "",
+    "publicIpv4": "34.131.221.94",
+    "publicIpv6": "",
+    "natStatus": "",
+    "localIpv4Port": "",
+    "publicIpv4Port": "",
+    "publicIpv6Port": "",
+    "communicatorIP": "",
+    "communicatorPort": "",
+    "listeningPort": 8888
+    },
+    {
+      "hashID": "a0b65939670bcf5f5f8c5b1f5e5c5d5e5f5e5c5a",
+      "publicKey": "",
+      "sign": "",
+      "publicKeyPem": "",
+      "localIpv4": "",
+      "publicIpv4": "34.42.208.193",
+      "publicIpv6": "",
+      "natStatus": "",
+      "localIpv4Port": "",
+      "publicIpv4Port": "",
+      "publicIpv6Port": "",
+      "communicatorIP": "",
+      "communicatorPort": "",
+      "listeningPort": 8888
+    },
+    {
+      "hashID": "f0e2c7a9d3b86e5f91b4e7d8a2c3f4d6078a1b9c",
+      "publicKey": "",
+      "sign": "",
+      "publicKeyPem": "",
+      "localIpv4": "",
+      "publicIpv4": "34.131.23.82",
+      "publicIpv6": "",
+      "natStatus": "",
+      "localIpv4Port": "",
+      "publicIpv4Port": "",
+      "publicIpv6Port": "",
+      "communicatorIP": "",
+      "communicatorPort": "",
+      "listeningPort": 8888
+    }
+   
+  ]
